@@ -1,5 +1,16 @@
 use crate::process::ProcessInfo;
+use crossterm::event::KeyCode;
 use ratatui::widgets::TableState;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Quit,
+    KillConfirmed { pid: u32, name: String },
+}
+
+pub const REFRESH_STEPS_MS: &[u64] = &[250, 500, 1000, 2000, 5000];
+pub const DEFAULT_REFRESH_MS: u64 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
@@ -22,12 +33,23 @@ pub enum FilterMode {
     Applied,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KillPrompt {
+    pub pid: u32,
+    pub name: String,
+}
+
 pub struct AppState {
     pub table: TableState,
     pub sort_key: SortKey,
     pub sort_dir: SortDir,
     pub filter_mode: FilterMode,
     pub filter: String,
+    pub show_details: bool,
+    pub kill_prompt: Option<KillPrompt>,
+    pub status_msg: Option<String>,
+    pub paused: bool,
+    pub refresh_ms: u64,
 }
 
 impl AppState {
@@ -40,7 +62,48 @@ impl AppState {
             sort_dir: SortDir::Asc,
             filter_mode: FilterMode::Inactive,
             filter: String::new(),
+            show_details: false,
+            kill_prompt: None,
+            status_msg: None,
+            paused: false,
+            refresh_ms: DEFAULT_REFRESH_MS,
         }
+    }
+
+    pub fn toggle_details(&mut self) {
+        self.show_details = !self.show_details;
+    }
+
+    pub fn request_kill(&mut self, pid: u32, name: String) {
+        self.kill_prompt = Some(KillPrompt { pid, name });
+    }
+
+    pub fn cancel_kill(&mut self) {
+        self.kill_prompt = None;
+    }
+
+    pub fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+    }
+
+    pub fn faster_refresh(&mut self) {
+        let cur = self.refresh_ms;
+        self.refresh_ms = REFRESH_STEPS_MS
+            .iter()
+            .rev()
+            .find(|&&ms| ms < cur)
+            .copied()
+            .unwrap_or(REFRESH_STEPS_MS[0]);
+    }
+
+    pub fn slower_refresh(&mut self) {
+        let cur = self.refresh_ms;
+        let last = *REFRESH_STEPS_MS.last().expect("non-empty");
+        self.refresh_ms = REFRESH_STEPS_MS
+            .iter()
+            .find(|&&ms| ms > cur)
+            .copied()
+            .unwrap_or(last);
     }
 
     pub fn start_filter_edit(&mut self) {
@@ -156,6 +219,77 @@ pub fn filter_indices(processes: &[ProcessInfo], filter: &str) -> Vec<usize> {
         .filter(|(_, p)| p.name.to_lowercase().contains(&needle))
         .map(|(i, _)| i)
         .collect()
+}
+
+pub fn handle_key(
+    state: &mut AppState,
+    code: KeyCode,
+    total: usize,
+    page_size: usize,
+    selected: Option<&(u32, String)>,
+) -> Action {
+    if state.kill_prompt.is_some() {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let prompt = state.kill_prompt.take().expect("checked above");
+                return Action::KillConfirmed {
+                    pid: prompt.pid,
+                    name: prompt.name,
+                };
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => state.cancel_kill(),
+            _ => {}
+        }
+        return Action::None;
+    }
+
+    if state.filter_mode == FilterMode::Editing {
+        match code {
+            KeyCode::Esc => state.clear_filter(),
+            KeyCode::Enter => state.confirm_filter(),
+            KeyCode::Backspace => {
+                state.filter.pop();
+            }
+            KeyCode::Char(ch) => state.filter.push(ch),
+            _ => {}
+        }
+        return Action::None;
+    }
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => return Action::Quit,
+        KeyCode::Char('/') => state.start_filter_edit(),
+        KeyCode::Esc => {
+            if state.status_msg.is_some() {
+                state.status_msg = None;
+            } else if state.show_details {
+                state.show_details = false;
+            } else {
+                state.clear_filter();
+            }
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => state.toggle_sort(SortKey::Cpu),
+        KeyCode::Char('m') | KeyCode::Char('M') => state.toggle_sort(SortKey::Memory),
+        KeyCode::Char('n') | KeyCode::Char('N') => state.toggle_sort(SortKey::Name),
+        KeyCode::Char('p') | KeyCode::Char('P') => state.toggle_sort(SortKey::Pid),
+        KeyCode::Char('d') | KeyCode::Char('D') => state.toggle_details(),
+        KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Delete => {
+            if let Some((pid, name)) = selected {
+                state.request_kill(*pid, name.clone());
+            }
+        }
+        KeyCode::Char(' ') => state.toggle_pause(),
+        KeyCode::Char('+') | KeyCode::Char('=') => state.faster_refresh(),
+        KeyCode::Char('-') | KeyCode::Char('_') => state.slower_refresh(),
+        KeyCode::Down => state.select_next(total),
+        KeyCode::Up => state.select_prev(total),
+        KeyCode::PageDown => state.page_down(total, page_size),
+        KeyCode::PageUp => state.page_up(total, page_size),
+        KeyCode::Home => state.select_first(total),
+        KeyCode::End => state.select_last(total),
+        _ => {}
+    }
+    Action::None
 }
 
 pub fn sort_processes(processes: &mut [ProcessInfo], key: SortKey, dir: SortDir) {
@@ -376,7 +510,348 @@ mod tests {
     }
 
     #[test]
-    fn clamp_to_shrinks_selection_when_list_shrinks() {
+    fn toggle_details_flips_bool() {
+        let mut s = AppState::new();
+        assert!(!s.show_details);
+        s.toggle_details();
+        assert!(s.show_details);
+        s.toggle_details();
+        assert!(!s.show_details);
+    }
+
+    #[test]
+    fn request_kill_stores_pid_and_name() {
+        let mut s = AppState::new();
+        assert!(s.kill_prompt.is_none());
+        s.request_kill(1234, "chrome.exe".to_string());
+        let prompt = s.kill_prompt.as_ref().expect("prompt set");
+        assert_eq!(prompt.pid, 1234);
+        assert_eq!(prompt.name, "chrome.exe");
+    }
+
+    #[test]
+    fn cancel_kill_clears_prompt() {
+        let mut s = AppState::new();
+        s.request_kill(1, "x".to_string());
+        s.cancel_kill();
+        assert!(s.kill_prompt.is_none());
+    }
+
+    // ---- handle_key tests ----
+
+    #[test]
+    fn handle_key_q_returns_quit() {
+        let mut s = AppState::new();
+        assert_eq!(
+            handle_key(&mut s, KeyCode::Char('q'), 10, 10, None),
+            Action::Quit
+        );
+        assert_eq!(
+            handle_key(&mut s, KeyCode::Char('Q'), 10, 10, None),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn handle_key_kill_prompt_y_confirms_and_clears_prompt() {
+        let mut s = AppState::new();
+        s.request_kill(1234, "chrome".to_string());
+        let act = handle_key(&mut s, KeyCode::Char('y'), 10, 10, None);
+        assert_eq!(
+            act,
+            Action::KillConfirmed {
+                pid: 1234,
+                name: "chrome".to_string()
+            }
+        );
+        assert!(s.kill_prompt.is_none());
+    }
+
+    #[test]
+    fn handle_key_kill_prompt_n_cancels() {
+        let mut s = AppState::new();
+        s.request_kill(1, "x".to_string());
+        let act = handle_key(&mut s, KeyCode::Char('n'), 10, 10, None);
+        assert_eq!(act, Action::None);
+        assert!(s.kill_prompt.is_none());
+    }
+
+    #[test]
+    fn handle_key_kill_prompt_esc_cancels() {
+        let mut s = AppState::new();
+        s.request_kill(1, "x".to_string());
+        let act = handle_key(&mut s, KeyCode::Esc, 10, 10, None);
+        assert_eq!(act, Action::None);
+        assert!(s.kill_prompt.is_none());
+    }
+
+    #[test]
+    fn handle_key_kill_prompt_blocks_navigation_and_quit() {
+        let mut s = AppState::new();
+        s.select_first(10);
+        s.request_kill(1, "x".to_string());
+
+        let act = handle_key(&mut s, KeyCode::Down, 10, 10, None);
+        assert_eq!(act, Action::None);
+        assert_eq!(s.table.selected(), Some(0));
+
+        let act = handle_key(&mut s, KeyCode::Char('q'), 10, 10, None);
+        assert_eq!(act, Action::None);
+        assert!(s.kill_prompt.is_some());
+    }
+
+    #[test]
+    fn handle_key_filter_edit_appends_char_and_pops_backspace() {
+        let mut s = AppState::new();
+        s.start_filter_edit();
+        handle_key(&mut s, KeyCode::Char('a'), 0, 10, None);
+        handle_key(&mut s, KeyCode::Char('b'), 0, 10, None);
+        assert_eq!(s.filter, "ab");
+        handle_key(&mut s, KeyCode::Backspace, 0, 10, None);
+        assert_eq!(s.filter, "a");
+    }
+
+    #[test]
+    fn handle_key_filter_edit_q_is_typed_not_quit() {
+        let mut s = AppState::new();
+        s.start_filter_edit();
+        let act = handle_key(&mut s, KeyCode::Char('q'), 0, 10, None);
+        assert_eq!(act, Action::None);
+        assert_eq!(s.filter, "q");
+        assert_eq!(s.filter_mode, FilterMode::Editing);
+    }
+
+    #[test]
+    fn handle_key_filter_edit_enter_confirms() {
+        let mut s = AppState::new();
+        s.start_filter_edit();
+        s.filter.push_str("ch");
+        handle_key(&mut s, KeyCode::Enter, 0, 10, None);
+        assert_eq!(s.filter_mode, FilterMode::Applied);
+        assert_eq!(s.filter, "ch");
+    }
+
+    #[test]
+    fn handle_key_filter_edit_esc_clears() {
+        let mut s = AppState::new();
+        s.start_filter_edit();
+        s.filter.push_str("x");
+        handle_key(&mut s, KeyCode::Esc, 0, 10, None);
+        assert_eq!(s.filter_mode, FilterMode::Inactive);
+        assert!(s.filter.is_empty());
+    }
+
+    #[test]
+    fn handle_key_slash_enters_filter_edit() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::Char('/'), 0, 10, None);
+        assert_eq!(s.filter_mode, FilterMode::Editing);
+    }
+
+    #[test]
+    fn handle_key_d_toggles_details() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::Char('d'), 0, 10, None);
+        assert!(s.show_details);
+        handle_key(&mut s, KeyCode::Char('d'), 0, 10, None);
+        assert!(!s.show_details);
+    }
+
+    #[test]
+    fn handle_key_k_opens_kill_prompt_for_selected() {
+        let mut s = AppState::new();
+        let sel = (5678u32, "firefox".to_string());
+        handle_key(&mut s, KeyCode::Char('k'), 10, 10, Some(&sel));
+        let p = s.kill_prompt.as_ref().expect("prompt set");
+        assert_eq!(p.pid, 5678);
+        assert_eq!(p.name, "firefox");
+    }
+
+    #[test]
+    fn handle_key_delete_also_opens_kill_prompt() {
+        let mut s = AppState::new();
+        let sel = (1u32, "x".to_string());
+        handle_key(&mut s, KeyCode::Delete, 10, 10, Some(&sel));
+        assert!(s.kill_prompt.is_some());
+    }
+
+    #[test]
+    fn handle_key_k_without_selection_is_noop() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::Char('k'), 0, 10, None);
+        assert!(s.kill_prompt.is_none());
+    }
+
+    #[test]
+    fn handle_key_esc_priority_status_msg_first() {
+        let mut s = AppState::new();
+        s.status_msg = Some("hi".to_string());
+        s.show_details = true;
+        s.filter.push_str("x");
+        s.filter_mode = FilterMode::Applied;
+        handle_key(&mut s, KeyCode::Esc, 0, 10, None);
+        assert!(s.status_msg.is_none());
+        assert!(s.show_details, "details should still be open");
+        assert_eq!(s.filter, "x", "filter should be untouched");
+    }
+
+    #[test]
+    fn handle_key_esc_priority_details_second() {
+        let mut s = AppState::new();
+        s.show_details = true;
+        s.filter.push_str("x");
+        s.filter_mode = FilterMode::Applied;
+        handle_key(&mut s, KeyCode::Esc, 0, 10, None);
+        assert!(!s.show_details);
+        assert_eq!(s.filter, "x", "filter should be untouched");
+    }
+
+    #[test]
+    fn handle_key_esc_priority_filter_last() {
+        let mut s = AppState::new();
+        s.filter.push_str("x");
+        s.filter_mode = FilterMode::Applied;
+        handle_key(&mut s, KeyCode::Esc, 0, 10, None);
+        assert!(s.filter.is_empty());
+        assert_eq!(s.filter_mode, FilterMode::Inactive);
+    }
+
+    #[test]
+    fn handle_key_arrows_navigate() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::Down, 5, 10, None);
+        assert_eq!(s.table.selected(), Some(1));
+        handle_key(&mut s, KeyCode::Up, 5, 10, None);
+        assert_eq!(s.table.selected(), Some(0));
+    }
+
+    #[test]
+    fn handle_key_page_keys_jump() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::PageDown, 100, 10, None);
+        assert_eq!(s.table.selected(), Some(10));
+        handle_key(&mut s, KeyCode::End, 100, 10, None);
+        assert_eq!(s.table.selected(), Some(99));
+        handle_key(&mut s, KeyCode::Home, 100, 10, None);
+        assert_eq!(s.table.selected(), Some(0));
+    }
+
+    #[test]
+    fn default_state_is_running_at_default_interval() {
+        let s = AppState::new();
+        assert!(!s.paused);
+        assert_eq!(s.refresh_ms, DEFAULT_REFRESH_MS);
+    }
+
+    #[test]
+    fn toggle_pause_flips_bool() {
+        let mut s = AppState::new();
+        s.toggle_pause();
+        assert!(s.paused);
+        s.toggle_pause();
+        assert!(!s.paused);
+    }
+
+    #[test]
+    fn faster_refresh_steps_down_through_array() {
+        let mut s = AppState::new();
+        assert_eq!(s.refresh_ms, 1000);
+        s.faster_refresh();
+        assert_eq!(s.refresh_ms, 500);
+        s.faster_refresh();
+        assert_eq!(s.refresh_ms, 250);
+    }
+
+    #[test]
+    fn faster_refresh_clamps_at_minimum() {
+        let mut s = AppState::new();
+        s.refresh_ms = REFRESH_STEPS_MS[0];
+        s.faster_refresh();
+        assert_eq!(s.refresh_ms, REFRESH_STEPS_MS[0]);
+    }
+
+    #[test]
+    fn slower_refresh_steps_up_through_array() {
+        let mut s = AppState::new();
+        assert_eq!(s.refresh_ms, 1000);
+        s.slower_refresh();
+        assert_eq!(s.refresh_ms, 2000);
+        s.slower_refresh();
+        assert_eq!(s.refresh_ms, 5000);
+    }
+
+    #[test]
+    fn slower_refresh_clamps_at_maximum() {
+        let mut s = AppState::new();
+        let max = *REFRESH_STEPS_MS.last().unwrap();
+        s.refresh_ms = max;
+        s.slower_refresh();
+        assert_eq!(s.refresh_ms, max);
+    }
+
+    #[test]
+    fn handle_key_space_toggles_pause() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::Char(' '), 0, 10, None);
+        assert!(s.paused);
+        handle_key(&mut s, KeyCode::Char(' '), 0, 10, None);
+        assert!(!s.paused);
+    }
+
+    #[test]
+    fn handle_key_plus_and_equals_make_faster() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::Char('+'), 0, 10, None);
+        assert_eq!(s.refresh_ms, 500);
+        handle_key(&mut s, KeyCode::Char('='), 0, 10, None);
+        assert_eq!(s.refresh_ms, 250);
+    }
+
+    #[test]
+    fn handle_key_minus_makes_slower() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::Char('-'), 0, 10, None);
+        assert_eq!(s.refresh_ms, 2000);
+    }
+
+    #[test]
+    fn handle_key_kill_prompt_blocks_pause_and_speed_keys() {
+        let mut s = AppState::new();
+        s.request_kill(1, "x".to_string());
+        let pre_paused = s.paused;
+        let pre_ms = s.refresh_ms;
+        handle_key(&mut s, KeyCode::Char(' '), 0, 10, None);
+        handle_key(&mut s, KeyCode::Char('+'), 0, 10, None);
+        handle_key(&mut s, KeyCode::Char('-'), 0, 10, None);
+        assert_eq!(s.paused, pre_paused);
+        assert_eq!(s.refresh_ms, pre_ms);
+        assert!(s.kill_prompt.is_some());
+    }
+
+    #[test]
+    fn handle_key_filter_edit_space_is_typed_not_pause() {
+        let mut s = AppState::new();
+        s.start_filter_edit();
+        handle_key(&mut s, KeyCode::Char(' '), 0, 10, None);
+        assert!(!s.paused);
+        assert_eq!(s.filter, " ");
+    }
+
+    #[test]
+    fn handle_key_sort_keys_change_sort_column() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::Char('c'), 0, 10, None);
+        assert_eq!(s.sort_key, SortKey::Cpu);
+        handle_key(&mut s, KeyCode::Char('m'), 0, 10, None);
+        assert_eq!(s.sort_key, SortKey::Memory);
+        handle_key(&mut s, KeyCode::Char('n'), 0, 10, None);
+        assert_eq!(s.sort_key, SortKey::Name);
+        handle_key(&mut s, KeyCode::Char('p'), 0, 10, None);
+        assert_eq!(s.sort_key, SortKey::Pid);
+    }
+
+    #[test]
+    fn clamp_to_shrinks_selection_when_list_shrinks() { 
         let mut s = AppState::new();
         s.select_last(50);
         assert_eq!(s.table.selected(), Some(49));
