@@ -1,4 +1,6 @@
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, RefreshKind, System};
+use sysinfo::{
+    CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
+};
 
 pub struct ProcessInfo {
     pub pid: u32,
@@ -30,27 +32,26 @@ impl Collector {
     }
 
     pub fn snapshot(&mut self) -> SystemSnapshot {
-        self.sys.refresh_all();
+        self.sys.refresh_cpu_usage();
+        self.sys.refresh_memory();
+        self.sys.refresh_processes(ProcessesToUpdate::All, true);
 
-        let cpu_count = self.sys.cpus().len() as f32;
-        let cpu_usage = self.sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / cpu_count;
+        let cpu_usage = self.sys.global_cpu_usage();
 
         let total_memory_gb = self.sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         let used_memory_gb = self.sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
 
-        let mut processes: Vec<ProcessInfo> = self
+        let processes: Vec<ProcessInfo> = self
             .sys
             .processes()
             .values()
             .map(|p| ProcessInfo {
                 pid: p.pid().as_u32(),
                 name: p.name().to_string_lossy().to_string(),
-                cpu: p.cpu_usage() / cpu_count,
+                cpu: p.cpu_usage(),
                 memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
             })
             .collect();
-
-        processes.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
 
         SystemSnapshot {
             processes,
