@@ -1,6 +1,7 @@
 use crate::process::ProcessInfo;
 use crossterm::event::KeyCode;
 use ratatui::widgets::TableState;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -12,16 +13,19 @@ pub enum Action {
 pub const REFRESH_STEPS_MS: &[u64] = &[250, 500, 1000, 2000, 5000];
 pub const DEFAULT_REFRESH_MS: u64 = 1000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SortKey {
     Cpu,
     Memory,
     Name,
+    #[default]
     Pid,
+    Io,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SortDir {
+    #[default]
     Asc,
     Desc,
 }
@@ -132,7 +136,7 @@ impl AppState {
         } else {
             self.sort_key = key;
             self.sort_dir = match key {
-                SortKey::Cpu | SortKey::Memory => SortDir::Desc,
+                SortKey::Cpu | SortKey::Memory | SortKey::Io => SortDir::Desc,
                 SortKey::Name | SortKey::Pid => SortDir::Asc,
             };
         }
@@ -272,6 +276,7 @@ pub fn handle_key(
         KeyCode::Char('m') | KeyCode::Char('M') => state.toggle_sort(SortKey::Memory),
         KeyCode::Char('n') | KeyCode::Char('N') => state.toggle_sort(SortKey::Name),
         KeyCode::Char('p') | KeyCode::Char('P') => state.toggle_sort(SortKey::Pid),
+        KeyCode::Char('i') | KeyCode::Char('I') => state.toggle_sort(SortKey::Io),
         KeyCode::Char('d') | KeyCode::Char('D') => state.toggle_details(),
         KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Delete => {
             if let Some((pid, name)) = selected {
@@ -303,6 +308,11 @@ pub fn sort_processes(processes: &mut [ProcessInfo], key: SortKey, dir: SortDir)
                 .unwrap_or(Ordering::Equal),
             SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             SortKey::Pid => a.pid.cmp(&b.pid),
+            SortKey::Io => {
+                let a_io = a.disk_read_mb + a.disk_write_mb;
+                let b_io = b.disk_read_mb + b.disk_write_mb;
+                a_io.partial_cmp(&b_io).unwrap_or(Ordering::Equal)
+            }
         };
         match dir {
             SortDir::Asc => ord,
@@ -321,6 +331,19 @@ mod tests {
             name: name.to_string(),
             cpu,
             memory_mb: mem,
+            disk_read_mb: 0.0,
+            disk_write_mb: 0.0,
+        }
+    }
+
+    fn proc_io(pid: u32, read: f64, write: f64) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            name: format!("p{pid}"),
+            cpu: 0.0,
+            memory_mb: 0.0,
+            disk_read_mb: read,
+            disk_write_mb: write,
         }
     }
 
@@ -848,6 +871,38 @@ mod tests {
         assert_eq!(s.sort_key, SortKey::Name);
         handle_key(&mut s, KeyCode::Char('p'), 0, 10, None);
         assert_eq!(s.sort_key, SortKey::Pid);
+        handle_key(&mut s, KeyCode::Char('i'), 0, 10, None);
+        assert_eq!(s.sort_key, SortKey::Io);
+    }
+
+    #[test]
+    fn sort_processes_by_io_desc_uses_read_plus_write() {
+        let mut v = vec![
+            proc_io(1, 10.0, 0.0),  // total 10
+            proc_io(2, 0.0, 50.0),  // total 50
+            proc_io(3, 30.0, 30.0), // total 60
+        ];
+        sort_processes(&mut v, SortKey::Io, SortDir::Desc);
+        assert_eq!(v.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn sort_processes_by_io_asc_uses_read_plus_write() {
+        let mut v = vec![
+            proc_io(1, 30.0, 30.0),
+            proc_io(2, 0.0, 50.0),
+            proc_io(3, 10.0, 0.0),
+        ];
+        sort_processes(&mut v, SortKey::Io, SortDir::Asc);
+        assert_eq!(v.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn toggle_sort_io_defaults_to_desc() {
+        let mut s = AppState::new();
+        s.toggle_sort(SortKey::Io);
+        assert_eq!(s.sort_key, SortKey::Io);
+        assert_eq!(s.sort_dir, SortDir::Desc);
     }
 
     #[test]

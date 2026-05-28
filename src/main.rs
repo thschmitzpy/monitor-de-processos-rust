@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod display;
 mod process;
 
@@ -17,9 +18,13 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
+    let cfg = config::load();
     let mut guard = display::TerminalGuard::new()?;
     let mut collector = process::Collector::new();
     let mut state = app::AppState::new();
+    state.sort_key = cfg.sort_key;
+    state.sort_dir = cfg.sort_dir;
+    state.refresh_ms = cfg.refresh_ms;
     let mut history = process::History::new();
     let mut snapshot = collector.snapshot();
     history.push(&snapshot);
@@ -76,6 +81,7 @@ fn run() -> io::Result<()> {
         }
     }
 
+    let _ = config::save(&config::Config::from_state(&state));
     Ok(())
 }
 

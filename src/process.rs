@@ -11,6 +11,8 @@ pub struct ProcessInfo {
     pub name: String,
     pub cpu: f32,
     pub memory_mb: f64,
+    pub disk_read_mb: f64,
+    pub disk_write_mb: f64,
 }
 
 pub struct ProcessDetail {
@@ -65,11 +67,16 @@ impl Collector {
             .sys
             .processes()
             .values()
-            .map(|p| ProcessInfo {
-                pid: p.pid().as_u32(),
-                name: p.name().to_string_lossy().to_string(),
-                cpu: p.cpu_usage(),
-                memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
+            .map(|p| {
+                let du = p.disk_usage();
+                ProcessInfo {
+                    pid: p.pid().as_u32(),
+                    name: p.name().to_string_lossy().to_string(),
+                    cpu: p.cpu_usage(),
+                    memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
+                    disk_read_mb: du.total_read_bytes as f64 / 1024.0 / 1024.0,
+                    disk_write_mb: du.total_written_bytes as f64 / 1024.0 / 1024.0,
+                }
             })
             .collect();
 

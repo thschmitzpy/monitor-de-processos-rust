@@ -99,7 +99,7 @@ fn ui(
         Line::from(vec![
             Span::styled("↑↓", hint_style),
             Span::raw(" navegar  "),
-            Span::styled("c/m/n/p", hint_style),
+            Span::styled("c/m/n/p/i", hint_style),
             Span::raw(" ordenar  "),
             Span::styled("/", hint_style),
             Span::raw(" filtrar  "),
@@ -180,6 +180,7 @@ fn ui(
         Cell::from(sort_label("NOME", SortKey::Name, state)),
         Cell::from(sort_label("CPU%", SortKey::Cpu, state)),
         Cell::from(sort_label("MEM (MB)", SortKey::Memory, state)),
+        Cell::from(sort_label("DISK R/W (MB)", SortKey::Io, state)),
     ])
     .style(
         Style::default()
@@ -195,6 +196,7 @@ fn ui(
                 Cell::from(p.name.clone()),
                 Cell::from(format!("{:.2}", p.cpu)),
                 Cell::from(format!("{:.1}", p.memory_mb)),
+                Cell::from(format!("{:.1}/{:.1}", p.disk_read_mb, p.disk_write_mb)),
             ])
             .style(Style::default().fg(process_cpu_color(p.cpu))),
         )
@@ -202,9 +204,10 @@ fn ui(
 
     let widths = [
         Constraint::Length(7),
-        Constraint::Min(20),
+        Constraint::Min(18),
         Constraint::Length(8),
         Constraint::Length(12),
+        Constraint::Length(16),
     ];
     let title = if state.filter.is_empty() {
         format!("Processos ({})", snapshot.processes.len())
