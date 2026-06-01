@@ -54,6 +54,8 @@ pub struct AppState {
     pub status_msg: Option<String>,
     pub paused: bool,
     pub refresh_ms: u64,
+    pub sort_frozen: bool,
+    pub frozen_order: Vec<u32>,
 }
 
 impl AppState {
@@ -71,6 +73,15 @@ impl AppState {
             status_msg: None,
             paused: false,
             refresh_ms: DEFAULT_REFRESH_MS,
+            sort_frozen: false,
+            frozen_order: Vec::new(),
+        }
+    }
+
+    pub fn toggle_freeze(&mut self) {
+        self.sort_frozen = !self.sort_frozen;
+        if !self.sort_frozen {
+            self.frozen_order.clear();
         }
     }
 
@@ -140,6 +151,7 @@ impl AppState {
                 SortKey::Name | SortKey::Pid => SortDir::Asc,
             };
         }
+        self.frozen_order.clear();
     }
 
     pub fn select_next(&mut self, total: usize) {
@@ -278,6 +290,7 @@ pub fn handle_key(
         KeyCode::Char('p') | KeyCode::Char('P') => state.toggle_sort(SortKey::Pid),
         KeyCode::Char('i') | KeyCode::Char('I') => state.toggle_sort(SortKey::Io),
         KeyCode::Char('d') | KeyCode::Char('D') => state.toggle_details(),
+        KeyCode::Char('f') | KeyCode::Char('F') => state.toggle_freeze(),
         KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Delete => {
             if let Some((pid, name)) = selected {
                 state.request_kill(*pid, name.clone());
@@ -295,6 +308,30 @@ pub fn handle_key(
         _ => {}
     }
     Action::None
+}
+
+pub fn stable_reorder(processes: &mut Vec<ProcessInfo>, order: &mut Vec<u32>) {
+    use std::collections::HashMap;
+    let mut by_pid: HashMap<u32, ProcessInfo> = processes.drain(..).map(|p| (p.pid, p)).collect();
+    let mut new_order: Vec<u32> = Vec::with_capacity(by_pid.len());
+    let mut new_list: Vec<ProcessInfo> = Vec::with_capacity(by_pid.len());
+
+    for pid in order.iter() {
+        if let Some(p) = by_pid.remove(pid) {
+            new_order.push(*pid);
+            new_list.push(p);
+        }
+    }
+
+    let mut leftovers: Vec<ProcessInfo> = by_pid.into_values().collect();
+    leftovers.sort_by_key(|p| p.pid);
+    for p in leftovers {
+        new_order.push(p.pid);
+        new_list.push(p);
+    }
+
+    *order = new_order;
+    *processes = new_list;
 }
 
 pub fn sort_processes(processes: &mut [ProcessInfo], key: SortKey, dir: SortDir) {
@@ -906,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn clamp_to_shrinks_selection_when_list_shrinks() { 
+    fn clamp_to_shrinks_selection_when_list_shrinks() {
         let mut s = AppState::new();
         s.select_last(50);
         assert_eq!(s.table.selected(), Some(49));
@@ -914,5 +951,107 @@ mod tests {
         assert_eq!(s.table.selected(), Some(9));
         s.clamp_to(0);
         assert_eq!(s.table.selected(), None);
+    }
+
+    // ---- sort freeze tests ----
+
+    #[test]
+    fn default_state_is_not_frozen() {
+        let s = AppState::new();
+        assert!(!s.sort_frozen);
+        assert!(s.frozen_order.is_empty());
+    }
+
+    #[test]
+    fn toggle_freeze_flips_bool_and_clears_order_on_off() {
+        let mut s = AppState::new();
+        s.toggle_freeze();
+        assert!(s.sort_frozen);
+        s.frozen_order = vec![1, 2, 3];
+        s.toggle_freeze();
+        assert!(!s.sort_frozen);
+        assert!(s.frozen_order.is_empty());
+    }
+
+    #[test]
+    fn handle_key_f_toggles_freeze() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::Char('f'), 0, 10, None);
+        assert!(s.sort_frozen);
+        handle_key(&mut s, KeyCode::Char('F'), 0, 10, None);
+        assert!(!s.sort_frozen);
+    }
+
+    #[test]
+    fn handle_key_f_in_filter_edit_is_typed_not_toggle() {
+        let mut s = AppState::new();
+        s.start_filter_edit();
+        handle_key(&mut s, KeyCode::Char('f'), 0, 10, None);
+        assert!(!s.sort_frozen);
+        assert_eq!(s.filter, "f");
+    }
+
+    #[test]
+    fn toggle_sort_invalidates_frozen_order() {
+        let mut s = AppState::new();
+        s.toggle_freeze();
+        s.frozen_order = vec![10, 20, 30];
+        s.toggle_sort(SortKey::Cpu);
+        assert!(s.sort_frozen, "ainda travado");
+        assert!(s.frozen_order.is_empty(), "ordem foi invalidada");
+    }
+
+    #[test]
+    fn stable_reorder_preserves_known_pid_order() {
+        let mut v = vec![
+            proc(3, "c", 0.0, 0.0),
+            proc(1, "a", 0.0, 0.0),
+            proc(2, "b", 0.0, 0.0),
+        ];
+        let mut order = vec![1u32, 2, 3];
+        stable_reorder(&mut v, &mut order);
+        assert_eq!(v.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(order, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn stable_reorder_appends_new_pids_sorted_at_end() {
+        let mut v = vec![
+            proc(7, "g", 0.0, 0.0), // novo
+            proc(1, "a", 0.0, 0.0),
+            proc(5, "e", 0.0, 0.0), // novo
+            proc(2, "b", 0.0, 0.0),
+        ];
+        let mut order = vec![1u32, 2];
+        stable_reorder(&mut v, &mut order);
+        assert_eq!(v.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![1, 2, 5, 7]);
+        assert_eq!(order, vec![1, 2, 5, 7]);
+    }
+
+    #[test]
+    fn stable_reorder_drops_dead_pids_from_order() {
+        let mut v = vec![proc(1, "a", 0.0, 0.0), proc(3, "c", 0.0, 0.0)];
+        let mut order = vec![1u32, 2, 3]; // pid 2 morreu
+        stable_reorder(&mut v, &mut order);
+        assert_eq!(v.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(order, vec![1, 3]);
+    }
+
+    #[test]
+    fn stable_reorder_empty_processes_yields_empty_order() {
+        let mut v: Vec<ProcessInfo> = vec![];
+        let mut order = vec![1u32, 2, 3];
+        stable_reorder(&mut v, &mut order);
+        assert!(v.is_empty());
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn handle_key_kill_prompt_blocks_freeze_toggle() {
+        let mut s = AppState::new();
+        s.request_kill(1, "x".to_string());
+        handle_key(&mut s, KeyCode::Char('f'), 0, 10, None);
+        assert!(!s.sort_frozen);
+        assert!(s.kill_prompt.is_some());
     }
 }

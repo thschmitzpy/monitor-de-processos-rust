@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::time::Instant;
 use sysinfo::{
     CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind,
     System,
@@ -40,6 +41,7 @@ pub struct SystemSnapshot {
 
 pub struct Collector {
     sys: System,
+    last_snapshot: Option<Instant>,
 }
 
 impl Collector {
@@ -50,13 +52,23 @@ impl Collector {
                 .with_memory(MemoryRefreshKind::everything())
                 .with_processes(ProcessRefreshKind::everything()),
         );
-        Self { sys }
+        Self {
+            sys,
+            last_snapshot: None,
+        }
     }
 
     pub fn snapshot(&mut self) -> SystemSnapshot {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
         self.sys.refresh_processes(ProcessesToUpdate::All, true);
+
+        let now = Instant::now();
+        let elapsed_secs = self
+            .last_snapshot
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .filter(|s| *s > 0.001);
+        self.last_snapshot = Some(now);
 
         let cpu_usage = self.sys.global_cpu_usage();
 
@@ -69,13 +81,20 @@ impl Collector {
             .values()
             .map(|p| {
                 let du = p.disk_usage();
+                let (read_rate, write_rate) = match elapsed_secs {
+                    Some(secs) => (
+                        (du.read_bytes as f64 / 1024.0 / 1024.0) / secs,
+                        (du.written_bytes as f64 / 1024.0 / 1024.0) / secs,
+                    ),
+                    None => (0.0, 0.0),
+                };
                 ProcessInfo {
                     pid: p.pid().as_u32(),
                     name: p.name().to_string_lossy().to_string(),
                     cpu: p.cpu_usage(),
                     memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
-                    disk_read_mb: du.total_read_bytes as f64 / 1024.0 / 1024.0,
-                    disk_write_mb: du.total_written_bytes as f64 / 1024.0 / 1024.0,
+                    disk_read_mb: read_rate,
+                    disk_write_mb: write_rate,
                 }
             })
             .collect();

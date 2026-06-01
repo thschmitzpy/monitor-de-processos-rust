@@ -94,6 +94,15 @@ fn ui(
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    if state.sort_frozen {
+        title_spans.push(Span::raw("   "));
+        title_spans.push(Span::styled(
+            "[TRAVADO]",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     let header = Paragraph::new(vec![
         Line::from(title_spans),
         Line::from(vec![
@@ -109,6 +118,8 @@ fn ui(
             Span::raw(" matar  "),
             Span::styled("space", hint_style),
             Span::raw(" pausa  "),
+            Span::styled("f", hint_style),
+            Span::raw(" trava  "),
             Span::styled("+/-", hint_style),
             Span::raw(" vel  "),
             Span::styled("q", hint_style),
@@ -180,7 +191,7 @@ fn ui(
         Cell::from(sort_label("NOME", SortKey::Name, state)),
         Cell::from(sort_label("CPU%", SortKey::Cpu, state)),
         Cell::from(sort_label("MEM (MB)", SortKey::Memory, state)),
-        Cell::from(sort_label("DISK R/W (MB)", SortKey::Io, state)),
+        Cell::from(sort_label("DISK R/W (MB/s)", SortKey::Io, state)),
     ])
     .style(
         Style::default()
@@ -322,7 +333,7 @@ fn render_details_popup(frame: &mut Frame, area: Rect, detail: Option<&ProcessDe
             row_line(
                 "Disco",
                 format!(
-                    "lido {:.1} MB  ·  escrito {:.1} MB",
+                    "lido {:.1} MB  ·  escrito {:.1} MB  (total)",
                     d.disk_read_mb, d.disk_write_mb
                 ),
                 label,

@@ -34,7 +34,14 @@ fn run() -> io::Result<()> {
             snapshot = collector.snapshot();
             history.push(&snapshot);
         }
-        app::sort_processes(&mut snapshot.processes, state.sort_key, state.sort_dir);
+        if state.sort_frozen && !state.frozen_order.is_empty() {
+            app::stable_reorder(&mut snapshot.processes, &mut state.frozen_order);
+        } else {
+            app::sort_processes(&mut snapshot.processes, state.sort_key, state.sort_dir);
+            if state.sort_frozen {
+                state.frozen_order = snapshot.processes.iter().map(|p| p.pid).collect();
+            }
+        }
         let visible = app::filter_indices(&snapshot.processes, &state.filter);
         state.clamp_to(visible.len());
 
