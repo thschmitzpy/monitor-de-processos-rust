@@ -1,4 +1,4 @@
-use crate::app::{AppState, FilterMode, SortDir, SortKey};
+use crate::app::{AppState, BranchKind, FilterMode, SortDir, SortKey, TreeRow, ViewMode};
 use crate::process::{History, ProcessDetail, SystemSnapshot};
 use crossterm::{
     cursor::{Hide, Show},
@@ -34,13 +34,13 @@ impl TerminalGuard {
     pub fn draw(
         &mut self,
         snapshot: &SystemSnapshot,
-        visible: &[usize],
+        rows: &[TreeRow],
         state: &mut AppState,
         detail: Option<&ProcessDetail>,
         history: &History,
     ) -> io::Result<()> {
         self.terminal
-            .draw(|frame| ui(frame, snapshot, visible, state, detail, history))?;
+            .draw(|frame| ui(frame, snapshot, rows, state, detail, history))?;
         Ok(())
     }
 }
@@ -55,7 +55,7 @@ impl Drop for TerminalGuard {
 fn ui(
     frame: &mut Frame,
     snapshot: &SystemSnapshot,
-    visible: &[usize],
+    rows: &[TreeRow],
     state: &mut AppState,
     detail: Option<&ProcessDetail>,
     history: &History,
@@ -103,6 +103,15 @@ fn ui(
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    if state.view_mode == ViewMode::Tree {
+        title_spans.push(Span::raw("   "));
+        title_spans.push(Span::styled(
+            "[ÁRVORE]",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     let header = Paragraph::new(vec![
         Line::from(title_spans),
         Line::from(vec![
@@ -120,6 +129,10 @@ fn ui(
             Span::raw(" pausa  "),
             Span::styled("f", hint_style),
             Span::raw(" trava  "),
+            Span::styled("t", hint_style),
+            Span::raw(" árvore  "),
+            Span::styled("Enter", hint_style),
+            Span::raw(" colapsa  "),
             Span::styled("+/-", hint_style),
             Span::raw(" vel  "),
             Span::styled("q", hint_style),
@@ -199,12 +212,17 @@ fn ui(
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows = visible.iter().filter_map(|&i| {
-        let p = snapshot.processes.get(i)?;
+    let table_rows = rows.iter().filter_map(|row| {
+        let p = snapshot.processes.get(row.idx)?;
+        let name_cell = if state.view_mode == ViewMode::Tree {
+            format_tree_name(row, &p.name)
+        } else {
+            p.name.clone()
+        };
         Some(
             Row::new(vec![
                 Cell::from(p.pid.to_string()),
-                Cell::from(p.name.clone()),
+                Cell::from(name_cell),
                 Cell::from(format!("{:.2}", p.cpu)),
                 Cell::from(format!("{:.1}", p.memory_mb)),
                 Cell::from(format!("{:.1}/{:.1}", p.disk_read_mb, p.disk_write_mb)),
@@ -223,13 +241,9 @@ fn ui(
     let title = if state.filter.is_empty() {
         format!("Processos ({})", snapshot.processes.len())
     } else {
-        format!(
-            "Processos ({}/{})",
-            visible.len(),
-            snapshot.processes.len()
-        )
+        format!("Processos ({}/{})", rows.len(), snapshot.processes.len())
     };
-    let table = Table::new(rows, widths)
+    let table = Table::new(table_rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(
@@ -464,6 +478,27 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+fn format_tree_name(row: &TreeRow, name: &str) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for b in &row.branches {
+        s.push_str(match b {
+            BranchKind::Pipe => "│  ",
+            BranchKind::Space => "   ",
+            BranchKind::Tee => "├─ ",
+            BranchKind::Corner => "└─ ",
+        });
+    }
+    if row.has_children {
+        s.push_str(if row.is_collapsed { "▶ " } else { "▼ " });
+    }
+    s.push_str(name);
+    if row.is_collapsed && row.collapsed_count > 0 {
+        let _ = write!(s, " ({})", row.collapsed_count);
+    }
+    s
+}
+
 fn sort_label(label: &str, col: SortKey, state: &AppState) -> String {
     if state.sort_key == col {
         let arrow = match state.sort_dir {
@@ -555,6 +590,71 @@ mod tests {
         assert_eq!(format_duration(3 * 60 + 7), "3m 7s");
         assert_eq!(format_duration(3600), "1h 0m 0s");
         assert_eq!(format_duration(2 * 3600 + 5 * 60 + 9), "2h 5m 9s");
+    }
+
+    #[test]
+    fn format_tree_name_root_no_children() {
+        let row = TreeRow {
+            idx: 0,
+            depth: 0,
+            branches: vec![],
+            has_children: false,
+            is_collapsed: false,
+            collapsed_count: 0,
+        };
+        assert_eq!(format_tree_name(&row, "systemd"), "systemd");
+    }
+
+    #[test]
+    fn format_tree_name_root_with_expanded_children() {
+        let row = TreeRow {
+            idx: 0,
+            depth: 0,
+            branches: vec![],
+            has_children: true,
+            is_collapsed: false,
+            collapsed_count: 0,
+        };
+        assert_eq!(format_tree_name(&row, "chrome"), "▼ chrome");
+    }
+
+    #[test]
+    fn format_tree_name_collapsed_shows_arrow_and_count() {
+        let row = TreeRow {
+            idx: 0,
+            depth: 0,
+            branches: vec![],
+            has_children: true,
+            is_collapsed: true,
+            collapsed_count: 7,
+        };
+        assert_eq!(format_tree_name(&row, "chrome"), "▶ chrome (7)");
+    }
+
+    #[test]
+    fn format_tree_name_nested_branches() {
+        let row = TreeRow {
+            idx: 0,
+            depth: 2,
+            branches: vec![BranchKind::Pipe, BranchKind::Tee],
+            has_children: false,
+            is_collapsed: false,
+            collapsed_count: 0,
+        };
+        assert_eq!(format_tree_name(&row, "leaf"), "│  ├─ leaf");
+    }
+
+    #[test]
+    fn format_tree_name_last_child_uses_corner() {
+        let row = TreeRow {
+            idx: 0,
+            depth: 1,
+            branches: vec![BranchKind::Corner],
+            has_children: false,
+            is_collapsed: false,
+            collapsed_count: 0,
+        };
+        assert_eq!(format_tree_name(&row, "tail"), "└─ tail");
     }
 
     #[test]

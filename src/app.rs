@@ -2,6 +2,7 @@ use crate::process::ProcessInfo;
 use crossterm::event::KeyCode;
 use ratatui::widgets::TableState;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -37,6 +38,13 @@ pub enum FilterMode {
     Applied,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    #[default]
+    Flat,
+    Tree,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillPrompt {
     pub pid: u32,
@@ -56,6 +64,9 @@ pub struct AppState {
     pub refresh_ms: u64,
     pub sort_frozen: bool,
     pub frozen_order: Vec<u32>,
+    pub frozen_tree_order: HashMap<Option<u32>, Vec<u32>>,
+    pub view_mode: ViewMode,
+    pub collapsed: HashSet<u32>,
 }
 
 impl AppState {
@@ -75,6 +86,25 @@ impl AppState {
             refresh_ms: DEFAULT_REFRESH_MS,
             sort_frozen: false,
             frozen_order: Vec::new(),
+            frozen_tree_order: HashMap::new(),
+            view_mode: ViewMode::Flat,
+            collapsed: HashSet::new(),
+        }
+    }
+
+    pub fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Flat => ViewMode::Tree,
+            ViewMode::Tree => ViewMode::Flat,
+        };
+        self.collapsed.clear();
+        self.frozen_order.clear();
+        self.frozen_tree_order.clear();
+    }
+
+    pub fn toggle_collapsed(&mut self, pid: u32) {
+        if !self.collapsed.insert(pid) {
+            self.collapsed.remove(&pid);
         }
     }
 
@@ -82,6 +112,7 @@ impl AppState {
         self.sort_frozen = !self.sort_frozen;
         if !self.sort_frozen {
             self.frozen_order.clear();
+            self.frozen_tree_order.clear();
         }
     }
 
@@ -152,6 +183,7 @@ impl AppState {
             };
         }
         self.frozen_order.clear();
+        self.frozen_tree_order.clear();
     }
 
     pub fn select_next(&mut self, total: usize) {
@@ -291,6 +323,12 @@ pub fn handle_key(
         KeyCode::Char('i') | KeyCode::Char('I') => state.toggle_sort(SortKey::Io),
         KeyCode::Char('d') | KeyCode::Char('D') => state.toggle_details(),
         KeyCode::Char('f') | KeyCode::Char('F') => state.toggle_freeze(),
+        KeyCode::Char('t') | KeyCode::Char('T') => state.toggle_view_mode(),
+        KeyCode::Enter => {
+            if let (ViewMode::Tree, Some((pid, _))) = (state.view_mode, selected) {
+                state.toggle_collapsed(*pid);
+            }
+        }
         KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Delete => {
             if let Some((pid, name)) = selected {
                 state.request_kill(*pid, name.clone());
@@ -334,6 +372,329 @@ pub fn stable_reorder(processes: &mut Vec<ProcessInfo>, order: &mut Vec<u32>) {
     *processes = new_list;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchKind {
+    Pipe,
+    Space,
+    Tee,
+    Corner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRow {
+    pub idx: usize,
+    pub depth: usize,
+    pub branches: Vec<BranchKind>,
+    pub has_children: bool,
+    pub is_collapsed: bool,
+    pub collapsed_count: usize,
+}
+
+pub fn build_flat_view(visible: &[usize]) -> Vec<TreeRow> {
+    visible
+        .iter()
+        .map(|&i| TreeRow {
+            idx: i,
+            depth: 0,
+            branches: Vec::new(),
+            has_children: false,
+            is_collapsed: false,
+            collapsed_count: 0,
+        })
+        .collect()
+}
+
+pub fn build_tree_view(
+    processes: &[ProcessInfo],
+    sort_key: SortKey,
+    sort_dir: SortDir,
+    collapsed: &HashSet<u32>,
+    filter: &str,
+    frozen: Option<&HashMap<Option<u32>, Vec<u32>>>,
+) -> Vec<TreeRow> {
+    let n = processes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let pid_to_idx: HashMap<u32, usize> = processes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.pid, i))
+        .collect();
+
+    let mut parent_of: Vec<Option<usize>> = vec![None; n];
+    for (idx, p) in processes.iter().enumerate() {
+        if let Some(ppid) = p.ppid
+            && let Some(&pidx) = pid_to_idx.get(&ppid)
+            && pidx != idx
+        {
+            parent_of[idx] = Some(pidx);
+        }
+    }
+
+    // Quebra ciclos (PID recycle, dados inconsistentes): qualquer nó cuja
+    // cadeia de ancestrais voltar a ele mesmo vira raiz.
+    let mut settled = vec![false; n];
+    for start in 0..n {
+        if settled[start] {
+            continue;
+        }
+        let mut path: Vec<usize> = Vec::new();
+        let mut path_set: HashSet<usize> = HashSet::new();
+        let mut cur = start;
+        loop {
+            if settled[cur] {
+                break;
+            }
+            if !path_set.insert(cur) {
+                parent_of[cur] = None;
+                break;
+            }
+            path.push(cur);
+            match parent_of[cur] {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        for node in path {
+            settled[node] = true;
+        }
+    }
+
+    let mut children_of: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (idx, parent) in parent_of.iter().enumerate() {
+        match parent {
+            Some(pidx) => children_of.entry(*pidx).or_default().push(idx),
+            None => roots.push(idx),
+        }
+    }
+
+    for (parent_idx, kids) in children_of.iter_mut() {
+        let parent_pid = Some(processes[*parent_idx].pid);
+        let frozen_kids = frozen.and_then(|f| f.get(&parent_pid));
+        order_siblings(kids, processes, sort_key, sort_dir, frozen_kids);
+    }
+    {
+        let frozen_roots = frozen.and_then(|f| f.get(&None));
+        order_siblings(&mut roots, processes, sort_key, sort_dir, frozen_roots);
+    }
+
+    let needle = filter.to_lowercase();
+    let mut visible: Vec<bool> = vec![false; n];
+    for &r in &roots {
+        mark_visible(r, &needle, processes, &children_of, &mut visible);
+    }
+
+    let mut out: Vec<TreeRow> = Vec::new();
+    let mut prefix: Vec<BranchKind> = Vec::new();
+    let visible_roots: Vec<usize> = roots.iter().copied().filter(|&i| visible[i]).collect();
+    let last_root = visible_roots.len().saturating_sub(1);
+    for (i, &r) in visible_roots.iter().enumerate() {
+        dfs_tree(
+            r,
+            i == last_root,
+            true,
+            &mut prefix,
+            processes,
+            &children_of,
+            &visible,
+            collapsed,
+            &mut out,
+        );
+    }
+    out
+}
+
+fn order_siblings(
+    idxs: &mut Vec<usize>,
+    processes: &[ProcessInfo],
+    key: SortKey,
+    dir: SortDir,
+    frozen: Option<&Vec<u32>>,
+) {
+    let Some(frozen) = frozen else {
+        sort_sibling_indices(idxs, processes, key, dir);
+        return;
+    };
+    let mut by_pid: HashMap<u32, usize> =
+        idxs.iter().map(|&i| (processes[i].pid, i)).collect();
+    let mut kept: Vec<usize> = Vec::with_capacity(idxs.len());
+    for pid in frozen {
+        if let Some(i) = by_pid.remove(pid) {
+            kept.push(i);
+        }
+    }
+    let mut leftovers: Vec<usize> = by_pid.into_values().collect();
+    sort_sibling_indices(&mut leftovers, processes, key, dir);
+    kept.extend(leftovers);
+    *idxs = kept;
+}
+
+pub fn capture_tree_order(
+    rows: &[TreeRow],
+    processes: &[ProcessInfo],
+) -> HashMap<Option<u32>, Vec<u32>> {
+    let mut result: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
+    let mut parent_stack: Vec<u32> = Vec::new();
+    for row in rows {
+        parent_stack.truncate(row.depth);
+        let pid = processes[row.idx].pid;
+        let parent_key = if row.depth == 0 {
+            None
+        } else {
+            parent_stack.last().copied()
+        };
+        result.entry(parent_key).or_default().push(pid);
+        parent_stack.push(pid);
+    }
+    result
+}
+
+fn sort_sibling_indices(
+    idxs: &mut [usize],
+    processes: &[ProcessInfo],
+    key: SortKey,
+    dir: SortDir,
+) {
+    use std::cmp::Ordering;
+    idxs.sort_by(|&a, &b| {
+        let pa = &processes[a];
+        let pb = &processes[b];
+        let ord = match key {
+            SortKey::Cpu => pa.cpu.partial_cmp(&pb.cpu).unwrap_or(Ordering::Equal),
+            SortKey::Memory => pa.memory_mb.partial_cmp(&pb.memory_mb).unwrap_or(Ordering::Equal),
+            SortKey::Name => pa.name.to_lowercase().cmp(&pb.name.to_lowercase()),
+            SortKey::Pid => pa.pid.cmp(&pb.pid),
+            SortKey::Io => {
+                let a_io = pa.disk_read_mb + pa.disk_write_mb;
+                let b_io = pb.disk_read_mb + pb.disk_write_mb;
+                a_io.partial_cmp(&b_io).unwrap_or(Ordering::Equal)
+            }
+        };
+        match dir {
+            SortDir::Asc => ord,
+            SortDir::Desc => ord.reverse(),
+        }
+    });
+}
+
+fn mark_visible(
+    idx: usize,
+    needle: &str,
+    processes: &[ProcessInfo],
+    children_of: &HashMap<usize, Vec<usize>>,
+    visible: &mut [bool],
+) -> bool {
+    let self_match = needle.is_empty() || processes[idx].name.to_lowercase().contains(needle);
+    let mut any_child = false;
+    if let Some(kids) = children_of.get(&idx) {
+        for &c in kids {
+            if mark_visible(c, needle, processes, children_of, visible) {
+                any_child = true;
+            }
+        }
+    }
+    let v = self_match || any_child;
+    visible[idx] = v;
+    v
+}
+
+fn count_visible_descendants(
+    idx: usize,
+    children_of: &HashMap<usize, Vec<usize>>,
+    visible: &[bool],
+) -> usize {
+    let Some(kids) = children_of.get(&idx) else {
+        return 0;
+    };
+    let mut total = 0;
+    for &c in kids {
+        if !visible[c] {
+            continue;
+        }
+        total += 1;
+        total += count_visible_descendants(c, children_of, visible);
+    }
+    total
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dfs_tree(
+    idx: usize,
+    is_last: bool,
+    is_root: bool,
+    prefix: &mut Vec<BranchKind>,
+    processes: &[ProcessInfo],
+    children_of: &HashMap<usize, Vec<usize>>,
+    visible: &[bool],
+    collapsed: &HashSet<u32>,
+    out: &mut Vec<TreeRow>,
+) {
+    let pid = processes[idx].pid;
+    let visible_kids: Vec<usize> = children_of
+        .get(&idx)
+        .map(|kids| kids.iter().copied().filter(|&c| visible[c]).collect())
+        .unwrap_or_default();
+    let has_children = !visible_kids.is_empty();
+    let is_collapsed = has_children && collapsed.contains(&pid);
+    let collapsed_count = if is_collapsed {
+        count_visible_descendants(idx, children_of, visible)
+    } else {
+        0
+    };
+
+    let mut branches = prefix.clone();
+    if !is_root {
+        branches.push(if is_last { BranchKind::Corner } else { BranchKind::Tee });
+    }
+    let depth = branches.len();
+
+    out.push(TreeRow {
+        idx,
+        depth,
+        branches,
+        has_children,
+        is_collapsed,
+        collapsed_count,
+    });
+
+    if is_collapsed {
+        return;
+    }
+
+    let pushed = if !is_root {
+        prefix.push(if is_last {
+            BranchKind::Space
+        } else {
+            BranchKind::Pipe
+        });
+        true
+    } else {
+        false
+    };
+
+    let last_child = visible_kids.len().saturating_sub(1);
+    for (i, &c) in visible_kids.iter().enumerate() {
+        dfs_tree(
+            c,
+            i == last_child,
+            false,
+            prefix,
+            processes,
+            children_of,
+            visible,
+            collapsed,
+            out,
+        );
+    }
+
+    if pushed {
+        prefix.pop();
+    }
+}
+
 pub fn sort_processes(processes: &mut [ProcessInfo], key: SortKey, dir: SortDir) {
     use std::cmp::Ordering;
     processes.sort_by(|a, b| {
@@ -365,6 +726,7 @@ mod tests {
     fn proc(pid: u32, name: &str, cpu: f32, mem: f64) -> ProcessInfo {
         ProcessInfo {
             pid,
+            ppid: None,
             name: name.to_string(),
             cpu,
             memory_mb: mem,
@@ -376,11 +738,24 @@ mod tests {
     fn proc_io(pid: u32, read: f64, write: f64) -> ProcessInfo {
         ProcessInfo {
             pid,
+            ppid: None,
             name: format!("p{pid}"),
             cpu: 0.0,
             memory_mb: 0.0,
             disk_read_mb: read,
             disk_write_mb: write,
+        }
+    }
+
+    fn proc_with_parent(pid: u32, ppid: Option<u32>, name: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid,
+            name: name.to_string(),
+            cpu: 0.0,
+            memory_mb: 0.0,
+            disk_read_mb: 0.0,
+            disk_write_mb: 0.0,
         }
     }
 
@@ -597,7 +972,6 @@ mod tests {
         assert!(s.kill_prompt.is_none());
     }
 
-    // ---- handle_key tests ----
 
     #[test]
     fn handle_key_q_returns_quit() {
@@ -1053,5 +1427,356 @@ mod tests {
         handle_key(&mut s, KeyCode::Char('f'), 0, 10, None);
         assert!(!s.sort_frozen);
         assert!(s.kill_prompt.is_some());
+    }
+
+
+    fn pids(rows: &[TreeRow], processes: &[ProcessInfo]) -> Vec<u32> {
+        rows.iter().map(|r| processes[r.idx].pid).collect()
+    }
+
+    #[test]
+    fn build_tree_view_empty_returns_empty() {
+        let v: Vec<ProcessInfo> = vec![];
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", None);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn build_tree_view_flat_when_no_relations() {
+        let v = vec![
+            proc_with_parent(3, None, "c"),
+            proc_with_parent(1, None, "a"),
+            proc_with_parent(2, None, "b"),
+        ];
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", None);
+        assert_eq!(pids(&rows, &v), vec![1, 2, 3]);
+        for row in &rows {
+            assert_eq!(row.depth, 0);
+            assert!(row.branches.is_empty());
+            assert!(!row.has_children);
+        }
+    }
+
+    #[test]
+    fn build_tree_view_nests_children_under_parent() {
+        let v = vec![
+            proc_with_parent(1, None, "root"),
+            proc_with_parent(2, Some(1), "child_a"),
+            proc_with_parent(3, Some(1), "child_b"),
+            proc_with_parent(4, Some(2), "grand"),
+        ];
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", None);
+        assert_eq!(pids(&rows, &v), vec![1, 2, 4, 3]);
+
+        let by_pid: HashMap<u32, &TreeRow> = rows
+            .iter()
+            .map(|r| (v[r.idx].pid, r))
+            .collect();
+
+        assert_eq!(by_pid[&1].depth, 0);
+        assert_eq!(by_pid[&1].branches, vec![]);
+        assert!(by_pid[&1].has_children);
+
+        assert_eq!(by_pid[&2].depth, 1);
+        assert_eq!(by_pid[&2].branches, vec![BranchKind::Tee]);
+        assert!(by_pid[&2].has_children);
+
+        assert_eq!(by_pid[&3].depth, 1);
+        assert_eq!(by_pid[&3].branches, vec![BranchKind::Corner]);
+
+        assert_eq!(by_pid[&4].depth, 2);
+        assert_eq!(by_pid[&4].branches, vec![BranchKind::Pipe, BranchKind::Corner]);
+    }
+
+    #[test]
+    fn build_tree_view_orphan_parent_becomes_root() {
+        let v = vec![
+            proc_with_parent(10, Some(999), "orphan"),
+            proc_with_parent(11, Some(10), "child"),
+        ];
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", None);
+        assert_eq!(pids(&rows, &v), vec![10, 11]);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].depth, 1);
+    }
+
+    #[test]
+    fn build_tree_view_self_parent_becomes_root() {
+        let v = vec![proc_with_parent(5, Some(5), "x")];
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].depth, 0);
+    }
+
+    #[test]
+    fn build_tree_view_breaks_cycle() {
+        let v = vec![
+            proc_with_parent(1, Some(2), "a"),
+            proc_with_parent(2, Some(1), "b"),
+        ];
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", None);
+        assert_eq!(rows.len(), 2);
+        let roots = rows.iter().filter(|r| r.depth == 0).count();
+        assert!(roots >= 1);
+    }
+
+    #[test]
+    fn build_tree_view_collapsed_hides_descendants() {
+        let v = vec![
+            proc_with_parent(1, None, "root"),
+            proc_with_parent(2, Some(1), "child"),
+            proc_with_parent(3, Some(2), "grand"),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(1);
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &collapsed, "", None);
+        assert_eq!(pids(&rows, &v), vec![1]);
+        assert!(rows[0].is_collapsed);
+        assert_eq!(rows[0].collapsed_count, 2);
+    }
+
+    #[test]
+    fn build_tree_view_collapsed_leaf_is_not_marked() {
+        let v = vec![proc_with_parent(1, None, "leaf")];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(1);
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &collapsed, "", None);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].is_collapsed, "folha não deve aparecer como colapsada");
+        assert!(!rows[0].has_children);
+    }
+
+    #[test]
+    fn build_tree_view_filter_preserves_ancestor_chain() {
+        let v = vec![
+            proc_with_parent(1, None, "root"),
+            proc_with_parent(2, Some(1), "branch"),
+            proc_with_parent(3, Some(2), "target"),
+            proc_with_parent(4, Some(1), "noise"),
+        ];
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &HashSet::new(), "target", None);
+        assert_eq!(pids(&rows, &v), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn build_tree_view_filter_no_match_returns_empty() {
+        let v = vec![
+            proc_with_parent(1, None, "root"),
+            proc_with_parent(2, Some(1), "child"),
+        ];
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &HashSet::new(), "zzz", None);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn build_tree_view_sorts_siblings_by_cpu_desc() {
+        let v = vec![
+            ProcessInfo { pid: 1, ppid: None, name: "p".into(), cpu: 0.0, memory_mb: 0.0, disk_read_mb: 0.0, disk_write_mb: 0.0 },
+            ProcessInfo { pid: 2, ppid: Some(1), name: "low".into(), cpu: 5.0, memory_mb: 0.0, disk_read_mb: 0.0, disk_write_mb: 0.0 },
+            ProcessInfo { pid: 3, ppid: Some(1), name: "high".into(), cpu: 90.0, memory_mb: 0.0, disk_read_mb: 0.0, disk_write_mb: 0.0 },
+            ProcessInfo { pid: 4, ppid: Some(1), name: "mid".into(), cpu: 50.0, memory_mb: 0.0, disk_read_mb: 0.0, disk_write_mb: 0.0 },
+        ];
+        let rows = build_tree_view(&v, SortKey::Cpu, SortDir::Desc, &HashSet::new(), "", None);
+        assert_eq!(pids(&rows, &v), vec![1, 3, 4, 2]);
+    }
+
+    #[test]
+    fn build_tree_view_branches_string_for_deep_tree() {
+        // raiz com 2 filhos; primeiro filho tem 2 netos
+        let v = vec![
+            proc_with_parent(1, None, "a"),
+            proc_with_parent(2, Some(1), "b"),
+            proc_with_parent(3, Some(1), "c"),
+            proc_with_parent(4, Some(2), "d"),
+            proc_with_parent(5, Some(2), "e"),
+        ];
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", None);
+        // ordem DFS: 1, 2, 4, 5, 3
+        assert_eq!(pids(&rows, &v), vec![1, 2, 4, 5, 3]);
+
+        // 1: root, sem branches
+        assert_eq!(rows[0].branches, vec![]);
+        // 2: filho de 1, com irmão (3) depois → Tee
+        assert_eq!(rows[1].branches, vec![BranchKind::Tee]);
+        // 4: neto, pai 2 ainda tem irmão (3) abaixo → Pipe; 4 tem irmão (5) → Tee
+        assert_eq!(rows[2].branches, vec![BranchKind::Pipe, BranchKind::Tee]);
+        // 5: neto, pai 2 ainda tem irmão (3) → Pipe; 5 é último → Corner
+        assert_eq!(rows[3].branches, vec![BranchKind::Pipe, BranchKind::Corner]);
+        // 3: filho de 1, último → Corner
+        assert_eq!(rows[4].branches, vec![BranchKind::Corner]);
+    }
+
+    #[test]
+    fn toggle_view_mode_swaps_and_clears_collapsed() {
+        let mut s = AppState::new();
+        s.collapsed.insert(123);
+        assert_eq!(s.view_mode, ViewMode::Flat);
+        s.toggle_view_mode();
+        assert_eq!(s.view_mode, ViewMode::Tree);
+        assert!(s.collapsed.is_empty(), "alternar modo limpa colapsados");
+        s.toggle_view_mode();
+        assert_eq!(s.view_mode, ViewMode::Flat);
+    }
+
+    #[test]
+    fn toggle_collapsed_inserts_and_removes() {
+        let mut s = AppState::new();
+        s.toggle_collapsed(42);
+        assert!(s.collapsed.contains(&42));
+        s.toggle_collapsed(42);
+        assert!(!s.collapsed.contains(&42));
+    }
+
+    #[test]
+    fn handle_key_t_toggles_view_mode() {
+        let mut s = AppState::new();
+        handle_key(&mut s, KeyCode::Char('t'), 0, 10, None);
+        assert_eq!(s.view_mode, ViewMode::Tree);
+        handle_key(&mut s, KeyCode::Char('T'), 0, 10, None);
+        assert_eq!(s.view_mode, ViewMode::Flat);
+    }
+
+    #[test]
+    fn handle_key_enter_in_tree_toggles_collapse_on_selected() {
+        let mut s = AppState::new();
+        s.view_mode = ViewMode::Tree;
+        let sel = (777u32, "x".to_string());
+        handle_key(&mut s, KeyCode::Enter, 1, 10, Some(&sel));
+        assert!(s.collapsed.contains(&777));
+        handle_key(&mut s, KeyCode::Enter, 1, 10, Some(&sel));
+        assert!(!s.collapsed.contains(&777));
+    }
+
+    #[test]
+    fn handle_key_enter_in_flat_is_noop() {
+        let mut s = AppState::new();
+        let sel = (1u32, "x".to_string());
+        handle_key(&mut s, KeyCode::Enter, 1, 10, Some(&sel));
+        assert!(s.collapsed.is_empty());
+    }
+
+    #[test]
+    fn capture_tree_order_records_siblings_by_parent() {
+        let v = vec![
+            proc_with_parent(1, None, "root"),
+            proc_with_parent(2, Some(1), "a"),
+            proc_with_parent(3, Some(1), "b"),
+            proc_with_parent(4, Some(2), "grand"),
+            proc_with_parent(5, None, "another_root"),
+        ];
+        let rows = build_tree_view(&v, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", None);
+        let captured = capture_tree_order(&rows, &v);
+        assert_eq!(captured.get(&None).unwrap(), &vec![1, 5]);
+        assert_eq!(captured.get(&Some(1)).unwrap(), &vec![2, 3]);
+        assert_eq!(captured.get(&Some(2)).unwrap(), &vec![4]);
+    }
+
+    #[test]
+    fn build_tree_view_with_frozen_order_preserves_siblings_under_changing_cpu() {
+        let make = |cpu2: f32, cpu3: f32| {
+            vec![
+                ProcessInfo { pid: 1, ppid: None, name: "root".into(), cpu: 0.0, memory_mb: 0.0, disk_read_mb: 0.0, disk_write_mb: 0.0 },
+                ProcessInfo { pid: 2, ppid: Some(1), name: "a".into(), cpu: cpu2, memory_mb: 0.0, disk_read_mb: 0.0, disk_write_mb: 0.0 },
+                ProcessInfo { pid: 3, ppid: Some(1), name: "b".into(), cpu: cpu3, memory_mb: 0.0, disk_read_mb: 0.0, disk_write_mb: 0.0 },
+            ]
+        };
+        // ordena por CPU desc: pid 2 tem 90, pid 3 tem 10 → ordem 2,3
+        let v1 = make(90.0, 10.0);
+        let rows1 = build_tree_view(&v1, SortKey::Cpu, SortDir::Desc, &HashSet::new(), "", None);
+        assert_eq!(pids(&rows1, &v1), vec![1, 2, 3]);
+
+        // captura ordem
+        let frozen = capture_tree_order(&rows1, &v1);
+
+        // CPU inverte (3 agora alto, 2 baixo) — sem frozen, ordem mudaria para 1,3,2
+        let v2 = make(5.0, 95.0);
+        let rows_unfrozen = build_tree_view(&v2, SortKey::Cpu, SortDir::Desc, &HashSet::new(), "", None);
+        assert_eq!(pids(&rows_unfrozen, &v2), vec![1, 3, 2]);
+
+        // com frozen, ordem permanece 1,2,3
+        let rows_frozen = build_tree_view(&v2, SortKey::Cpu, SortDir::Desc, &HashSet::new(), "", Some(&frozen));
+        assert_eq!(pids(&rows_frozen, &v2), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn build_tree_view_with_frozen_appends_new_pids_sorted_at_end() {
+        // Trava captura ordem [2, 3] como filhos de 1. Depois aparece o pid 4.
+        let v_initial = vec![
+            proc_with_parent(1, None, "root"),
+            proc_with_parent(2, Some(1), "a"),
+            proc_with_parent(3, Some(1), "b"),
+        ];
+        let rows_initial = build_tree_view(&v_initial, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", None);
+        let frozen = capture_tree_order(&rows_initial, &v_initial);
+
+        let v_after = vec![
+            proc_with_parent(1, None, "root"),
+            proc_with_parent(2, Some(1), "a"),
+            proc_with_parent(3, Some(1), "b"),
+            proc_with_parent(4, Some(1), "novo"),
+        ];
+        let rows = build_tree_view(&v_after, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", Some(&frozen));
+        // 2 e 3 mantêm posição original; 4 aparece no fim
+        assert_eq!(pids(&rows, &v_after), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn build_tree_view_with_frozen_drops_dead_pids_silently() {
+        let v_initial = vec![
+            proc_with_parent(1, None, "root"),
+            proc_with_parent(2, Some(1), "a"),
+            proc_with_parent(3, Some(1), "b"),
+            proc_with_parent(4, Some(1), "c"),
+        ];
+        let rows_initial = build_tree_view(&v_initial, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", None);
+        let frozen = capture_tree_order(&rows_initial, &v_initial);
+
+        // pid 3 morreu
+        let v_after = vec![
+            proc_with_parent(1, None, "root"),
+            proc_with_parent(2, Some(1), "a"),
+            proc_with_parent(4, Some(1), "c"),
+        ];
+        let rows = build_tree_view(&v_after, SortKey::Pid, SortDir::Asc, &HashSet::new(), "", Some(&frozen));
+        assert_eq!(pids(&rows, &v_after), vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn toggle_freeze_off_clears_tree_order_too() {
+        let mut s = AppState::new();
+        s.frozen_tree_order.insert(None, vec![1, 2]);
+        s.toggle_freeze();
+        assert!(s.sort_frozen);
+        s.toggle_freeze();
+        assert!(!s.sort_frozen);
+        assert!(s.frozen_tree_order.is_empty());
+    }
+
+    #[test]
+    fn toggle_sort_invalidates_tree_order() {
+        let mut s = AppState::new();
+        s.toggle_freeze();
+        s.frozen_tree_order.insert(None, vec![1, 2]);
+        s.toggle_sort(SortKey::Cpu);
+        assert!(s.frozen_tree_order.is_empty());
+    }
+
+    #[test]
+    fn toggle_view_mode_clears_tree_order() {
+        let mut s = AppState::new();
+        s.frozen_tree_order.insert(None, vec![1, 2]);
+        s.frozen_order = vec![1, 2];
+        s.toggle_view_mode();
+        assert!(s.frozen_tree_order.is_empty());
+        assert!(s.frozen_order.is_empty());
+    }
+
+    #[test]
+    fn handle_key_t_in_filter_edit_is_typed_not_toggle() {
+        let mut s = AppState::new();
+        s.start_filter_edit();
+        handle_key(&mut s, KeyCode::Char('t'), 0, 10, None);
+        assert_eq!(s.view_mode, ViewMode::Flat);
+        assert_eq!(s.filter, "t");
     }
 }

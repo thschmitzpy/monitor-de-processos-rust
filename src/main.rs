@@ -34,18 +34,44 @@ fn run() -> io::Result<()> {
             snapshot = collector.snapshot();
             history.push(&snapshot);
         }
-        if state.sort_frozen && !state.frozen_order.is_empty() {
-            app::stable_reorder(&mut snapshot.processes, &mut state.frozen_order);
-        } else {
-            app::sort_processes(&mut snapshot.processes, state.sort_key, state.sort_dir);
-            if state.sort_frozen {
-                state.frozen_order = snapshot.processes.iter().map(|p| p.pid).collect();
+        let rows = match state.view_mode {
+            app::ViewMode::Flat => {
+                if state.sort_frozen && !state.frozen_order.is_empty() {
+                    app::stable_reorder(&mut snapshot.processes, &mut state.frozen_order);
+                } else {
+                    app::sort_processes(&mut snapshot.processes, state.sort_key, state.sort_dir);
+                    if state.sort_frozen {
+                        state.frozen_order =
+                            snapshot.processes.iter().map(|p| p.pid).collect();
+                    }
+                }
+                let visible = app::filter_indices(&snapshot.processes, &state.filter);
+                app::build_flat_view(&visible)
             }
-        }
-        let visible = app::filter_indices(&snapshot.processes, &state.filter);
-        state.clamp_to(visible.len());
+            app::ViewMode::Tree => {
+                let frozen_param = if state.sort_frozen && !state.frozen_tree_order.is_empty() {
+                    Some(&state.frozen_tree_order)
+                } else {
+                    None
+                };
+                let tree_rows = app::build_tree_view(
+                    &snapshot.processes,
+                    state.sort_key,
+                    state.sort_dir,
+                    &state.collapsed,
+                    &state.filter,
+                    frozen_param,
+                );
+                if state.sort_frozen && state.frozen_tree_order.is_empty() {
+                    state.frozen_tree_order =
+                        app::capture_tree_order(&tree_rows, &snapshot.processes);
+                }
+                tree_rows
+            }
+        };
+        state.clamp_to(rows.len());
 
-        let selected_pid_name = selected_process(&snapshot, &visible, &state)
+        let selected_pid_name = selected_process(&snapshot, &rows, &state)
             .map(|p| (p.pid, p.name.clone()));
 
         let detail = if state.show_details {
@@ -56,7 +82,7 @@ fn run() -> io::Result<()> {
             None
         };
 
-        guard.draw(&snapshot, &visible, &mut state, detail.as_ref(), &history)?;
+        guard.draw(&snapshot, &rows, &mut state, detail.as_ref(), &history)?;
 
         if event::poll(Duration::from_millis(state.refresh_ms))? {
             if let Event::Key(KeyEvent {
@@ -68,7 +94,7 @@ fn run() -> io::Result<()> {
                 let action = app::handle_key(
                     &mut state,
                     code,
-                    visible.len(),
+                    rows.len(),
                     PAGE_SIZE,
                     selected_pid_name.as_ref(),
                 );
@@ -94,10 +120,10 @@ fn run() -> io::Result<()> {
 
 fn selected_process<'a>(
     snapshot: &'a process::SystemSnapshot,
-    visible: &[usize],
+    rows: &[app::TreeRow],
     state: &app::AppState,
 ) -> Option<&'a process::ProcessInfo> {
     let row = state.table.selected()?;
-    let idx = *visible.get(row)?;
+    let idx = rows.get(row)?.idx;
     snapshot.processes.get(idx)
 }

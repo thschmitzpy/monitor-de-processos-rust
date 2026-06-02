@@ -9,6 +9,7 @@ pub const HISTORY_CAPACITY: usize = 120;
 
 pub struct ProcessInfo {
     pub pid: u32,
+    pub ppid: Option<u32>,
     pub name: String,
     pub cpu: f32,
     pub memory_mb: f64,
@@ -90,6 +91,7 @@ impl Collector {
                 };
                 ProcessInfo {
                     pid: p.pid().as_u32(),
+                    ppid: p.parent().map(|pp| pp.as_u32()),
                     name: p.name().to_string_lossy().to_string(),
                     cpu: p.cpu_usage(),
                     memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
