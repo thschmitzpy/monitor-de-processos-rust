@@ -38,10 +38,24 @@ pub struct SystemSnapshot {
     pub cpu_usage: f32,
     pub used_memory_gb: f64,
     pub total_memory_gb: f64,
+    pub used_swap_gb: f64,
+    pub total_swap_gb: f64,
+    pub uptime_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemInfo {
+    pub os_name: Option<String>,
+    pub os_version: Option<String>,
+    pub kernel_version: Option<String>,
+    pub host_name: Option<String>,
+    pub cpu_brand: String,
+    pub cpu_count: usize,
 }
 
 pub struct Collector {
     sys: System,
+    info: SystemInfo,
     last_snapshot: Option<Instant>,
 }
 
@@ -53,10 +67,28 @@ impl Collector {
                 .with_memory(MemoryRefreshKind::everything())
                 .with_processes(ProcessRefreshKind::everything()),
         );
+        let cpu_brand = sys
+            .cpus()
+            .first()
+            .map(|c| c.brand().to_string())
+            .unwrap_or_default();
+        let info = SystemInfo {
+            os_name: System::name(),
+            os_version: System::os_version(),
+            kernel_version: System::kernel_version(),
+            host_name: System::host_name(),
+            cpu_brand,
+            cpu_count: sys.cpus().len(),
+        };
         Self {
             sys,
+            info,
             last_snapshot: None,
         }
+    }
+
+    pub fn info(&self) -> &SystemInfo {
+        &self.info
     }
 
     pub fn snapshot(&mut self) -> SystemSnapshot {
@@ -75,6 +107,9 @@ impl Collector {
 
         let total_memory_gb = self.sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         let used_memory_gb = self.sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+        let total_swap_gb = self.sys.total_swap() as f64 / 1024.0 / 1024.0 / 1024.0;
+        let used_swap_gb = self.sys.used_swap() as f64 / 1024.0 / 1024.0 / 1024.0;
+        let uptime_secs = System::uptime();
 
         let processes: Vec<ProcessInfo> = self
             .sys
@@ -106,6 +141,9 @@ impl Collector {
             cpu_usage,
             used_memory_gb,
             total_memory_gb,
+            used_swap_gb,
+            total_swap_gb,
+            uptime_secs,
         }
     }
 
@@ -205,6 +243,9 @@ mod tests {
             cpu_usage: cpu,
             used_memory_gb: used_gb,
             total_memory_gb: total_gb,
+            used_swap_gb: 0.0,
+            total_swap_gb: 0.0,
+            uptime_secs: 0,
         }
     }
 

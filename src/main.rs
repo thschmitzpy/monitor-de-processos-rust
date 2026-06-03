@@ -21,6 +21,7 @@ fn run() -> io::Result<()> {
     let cfg = config::load();
     let mut guard = display::TerminalGuard::new()?;
     let mut collector = process::Collector::new();
+    let info = collector.info().clone();
     let mut state = app::AppState::new();
     state.sort_key = cfg.sort_key;
     state.sort_dir = cfg.sort_dir;
@@ -82,7 +83,7 @@ fn run() -> io::Result<()> {
             None
         };
 
-        guard.draw(&snapshot, &rows, &mut state, detail.as_ref(), &history)?;
+        guard.draw(&snapshot, &info, &rows, &mut state, detail.as_ref(), &history)?;
 
         if event::poll(Duration::from_millis(state.refresh_ms))? {
             if let Event::Key(KeyEvent {

@@ -1,5 +1,5 @@
 use crate::app::{AppState, BranchKind, FilterMode, SortDir, SortKey, TreeRow, ViewMode};
-use crate::process::{History, ProcessDetail, SystemSnapshot};
+use crate::process::{History, ProcessDetail, SystemInfo, SystemSnapshot};
 use crossterm::{
     cursor::{Hide, Show},
     execute,
@@ -34,13 +34,14 @@ impl TerminalGuard {
     pub fn draw(
         &mut self,
         snapshot: &SystemSnapshot,
+        info: &SystemInfo,
         rows: &[TreeRow],
         state: &mut AppState,
         detail: Option<&ProcessDetail>,
         history: &History,
     ) -> io::Result<()> {
         self.terminal
-            .draw(|frame| ui(frame, snapshot, rows, state, detail, history))?;
+            .draw(|frame| ui(frame, snapshot, info, rows, state, detail, history))?;
         Ok(())
     }
 }
@@ -55,6 +56,7 @@ impl Drop for TerminalGuard {
 fn ui(
     frame: &mut Frame,
     snapshot: &SystemSnapshot,
+    info: &SystemInfo,
     rows: &[TreeRow],
     state: &mut AppState,
     detail: Option<&ProcessDetail>,
@@ -63,8 +65,8 @@ fn ui(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // header (title + hints)
-            Constraint::Length(3), // gauges row (CPU | RAM)
+            Constraint::Length(3), // header (title + host + hints)
+            Constraint::Length(3), // gauges row (CPU | RAM | SWAP?)
             Constraint::Length(4), // sparklines row (CPU | RAM)
             Constraint::Min(0),    // process table
             Constraint::Length(1), // footer (filtro)
@@ -112,8 +114,15 @@ fn ui(
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    title_spans.push(Span::raw("   "));
+    title_spans.push(Span::styled(
+        format!("⏱ up {}", format_uptime(snapshot.uptime_secs)),
+        Style::default().fg(Color::DarkGray),
+    ));
+
     let header = Paragraph::new(vec![
         Line::from(title_spans),
+        Line::from(host_line_spans(info)),
         Line::from(vec![
             Span::styled("↑↓", hint_style),
             Span::raw(" navegar  "),
@@ -141,14 +150,24 @@ fn ui(
     ]);
     frame.render_widget(header, chunks[0]);
 
+    let has_swap = snapshot.total_swap_gb > 0.0;
     let gauges = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints(if has_swap {
+            vec![
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ]
+        } else {
+            vec![Constraint::Percentage(50), Constraint::Percentage(50)]
+        })
         .split(chunks[1]);
 
     let cpu_ratio = (snapshot.cpu_usage / 100.0).clamp(0.0, 1.0) as f64;
+    let cpu_title = format!("CPU ({} núcleos)", info.cpu_count);
     let cpu_gauge = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title("CPU"))
+        .block(Block::default().borders(Borders::ALL).title(cpu_title))
         .gauge_style(Style::default().fg(cpu_color(snapshot.cpu_usage)))
         .ratio(cpu_ratio)
         .label(format!("{:.1}%", snapshot.cpu_usage));
@@ -168,6 +187,19 @@ fn ui(
             snapshot.used_memory_gb, snapshot.total_memory_gb
         ));
     frame.render_widget(ram_gauge, gauges[1]);
+
+    if has_swap {
+        let swap_ratio = (snapshot.used_swap_gb / snapshot.total_swap_gb).clamp(0.0, 1.0);
+        let swap_gauge = Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title("SWAP"))
+            .gauge_style(Style::default().fg(mem_color((swap_ratio * 100.0) as f32)))
+            .ratio(swap_ratio)
+            .label(format!(
+                "{:.1} / {:.1} GB",
+                snapshot.used_swap_gb, snapshot.total_swap_gb
+            ));
+        frame.render_widget(swap_gauge, gauges[2]);
+    }
 
     let sparks = Layout::default()
         .direction(Direction::Horizontal)
@@ -275,7 +307,7 @@ fn ui(
                 Span::styled("_", Style::default().fg(Color::Cyan)),
                 Span::raw("    "),
                 Span::styled(
-                    "Enter aplica  Esc cancela",
+                    "filtrando ao vivo  Esc descarta  Enter fixa",
                     Style::default().fg(Color::DarkGray),
                 ),
             ])),
@@ -478,6 +510,63 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+fn host_line_spans(info: &SystemInfo) -> Vec<Span<'_>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::Gray);
+    let mut spans: Vec<Span<'_>> = Vec::new();
+    let push_sep = |spans: &mut Vec<Span<'_>>| {
+        if !spans.is_empty() {
+            spans.push(Span::styled("  ·  ", dim));
+        }
+    };
+    let os = match (info.os_name.as_deref(), info.os_version.as_deref()) {
+        (Some(name), Some(ver)) => Some(format!("{name} {ver}")),
+        (Some(name), None) => Some(name.to_string()),
+        _ => None,
+    };
+    if let Some(os) = os {
+        spans.push(Span::styled(os, val));
+    }
+    if let Some(k) = info.kernel_version.as_deref() {
+        push_sep(&mut spans);
+        spans.push(Span::styled(format!("kernel {k}"), val));
+    }
+    if let Some(h) = info.host_name.as_deref() {
+        push_sep(&mut spans);
+        spans.push(Span::styled(h.to_string(), val));
+    }
+    if !info.cpu_brand.is_empty() {
+        push_sep(&mut spans);
+        spans.push(Span::styled(truncate(&info.cpu_brand, 40), val));
+    }
+    spans
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn format_uptime(secs: u64) -> String {
+    let d = secs / 86_400;
+    let h = (secs % 86_400) / 3600;
+    let m = (secs % 3600) / 60;
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn format_tree_name(row: &TreeRow, name: &str) -> String {
     use std::fmt::Write;
     let mut s = String::new();
@@ -655,6 +744,36 @@ mod tests {
             collapsed_count: 0,
         };
         assert_eq!(format_tree_name(&row, "tail"), "└─ tail");
+    }
+
+    #[test]
+    fn format_uptime_picks_biggest_unit() {
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(45), "45s");
+        assert_eq!(format_uptime(60), "1m");
+        assert_eq!(format_uptime(3 * 60 + 7), "3m");
+        assert_eq!(format_uptime(3600), "1h 0m");
+        assert_eq!(format_uptime(3 * 3600 + 25 * 60), "3h 25m");
+        assert_eq!(format_uptime(86_400), "1d 0h");
+        assert_eq!(format_uptime(2 * 86_400 + 5 * 3600), "2d 5h");
+    }
+
+    #[test]
+    fn truncate_keeps_short_strings_intact() {
+        assert_eq!(truncate("abc", 10), "abc");
+        assert_eq!(truncate("", 10), "");
+    }
+
+    #[test]
+    fn truncate_adds_ellipsis_when_too_long() {
+        assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn truncate_is_unicode_safe() {
+        // 4 chars: ç, ã, é, ô
+        assert_eq!(truncate("çãéô", 4), "çãéô");
+        assert_eq!(truncate("çãéô", 2), "çã…");
     }
 
     #[test]
